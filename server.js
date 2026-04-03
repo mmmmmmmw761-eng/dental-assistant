@@ -24,12 +24,29 @@ const WORKING_HOURS = {
 // ─── Google Calendar ──────────────────────────────────────────────────────────
 
 function getCalendarClient() {
+  const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+  const rawKey = process.env.GOOGLE_PRIVATE_KEY;
+
+  if (!email || !rawKey) {
+    throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_EMAIL or GOOGLE_PRIVATE_KEY in environment");
+  }
+
+  const key = rawKey.replace(/\\n/g, "\n");
+
   const auth = new google.auth.JWT({
-    email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-    key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+    email,
+    key,
     scopes: ["https://www.googleapis.com/auth/calendar"],
   });
   return google.calendar({ version: "v3", auth });
+}
+
+function logGoogleError(context, err) {
+  const status = err?.response?.status;
+  const message = err?.response?.data?.error?.message || err.message;
+  const errors = err?.response?.data?.error?.errors;
+  console.error(`[Google Calendar] ${context} — status: ${status ?? "n/a"}, message: ${message}`);
+  if (errors) console.error(`[Google Calendar] details:`, JSON.stringify(errors));
 }
 
 // ─── Вспомогательные функции ─────────────────────────────────────────────────
@@ -116,13 +133,19 @@ async function checkAvailability({ date }) {
   const dayStart = new Date(`${date}T00:00:00`).toISOString();
   const dayEnd = new Date(`${date}T23:59:59`).toISOString();
 
-  const freeBusyResponse = await calendar.freebusy.query({
-    requestBody: {
-      timeMin: dayStart,
-      timeMax: dayEnd,
-      items: [{ id: calendarId }],
-    },
-  });
+  let freeBusyResponse;
+  try {
+    freeBusyResponse = await calendar.freebusy.query({
+      requestBody: {
+        timeMin: dayStart,
+        timeMax: dayEnd,
+        items: [{ id: calendarId }],
+      },
+    });
+  } catch (err) {
+    logGoogleError(`checkAvailability freebusy.query date=${date}`, err);
+    throw err;
+  }
 
   const busyPeriods = freeBusyResponse.data.calendars[calendarId]?.busy || [];
   const slotDurationMs = SLOT_DURATION_MINUTES * 60 * 1000;
@@ -174,13 +197,19 @@ async function bookAppointment({ patient_name, service, date, time }) {
   const calendar = getCalendarClient();
   const calendarId = process.env.GOOGLE_CALENDAR_ID;
 
-  const freeBusyResponse = await calendar.freebusy.query({
-    requestBody: {
-      timeMin: startDateTime.toISOString(),
-      timeMax: endDateTime.toISOString(),
-      items: [{ id: calendarId }],
-    },
-  });
+  let freeBusyResponse;
+  try {
+    freeBusyResponse = await calendar.freebusy.query({
+      requestBody: {
+        timeMin: startDateTime.toISOString(),
+        timeMax: endDateTime.toISOString(),
+        items: [{ id: calendarId }],
+      },
+    });
+  } catch (err) {
+    logGoogleError(`bookAppointment freebusy.query date=${date} time=${time}`, err);
+    throw err;
+  }
 
   const busyPeriods = freeBusyResponse.data.calendars[calendarId]?.busy || [];
   if (busyPeriods.length > 0) {
@@ -188,15 +217,20 @@ async function bookAppointment({ patient_name, service, date, time }) {
   }
 
   // Создаём событие
-  await calendar.events.insert({
-    calendarId,
-    requestBody: {
-      summary: `${service} — ${patient_name}`,
-      description: `Пациент: ${patient_name}\nУслуга: ${service}`,
-      start: { dateTime: startDateTime.toISOString(), timeZone: "Europe/Moscow" },
-      end: { dateTime: endDateTime.toISOString(), timeZone: "Europe/Moscow" },
-    },
-  });
+  try {
+    await calendar.events.insert({
+      calendarId,
+      requestBody: {
+        summary: `${service} — ${patient_name}`,
+        description: `Пациент: ${patient_name}\nУслуга: ${service}`,
+        start: { dateTime: startDateTime.toISOString(), timeZone: "Europe/Moscow" },
+        end: { dateTime: endDateTime.toISOString(), timeZone: "Europe/Moscow" },
+      },
+    });
+  } catch (err) {
+    logGoogleError(`bookAppointment events.insert date=${date} time=${time} patient=${patient_name}`, err);
+    throw err;
+  }
 
   return `Отлично! ${patient_name}, вы записаны на ${service} ${formatDateRu(date)} в ${time}. Ждём вас в клинике «Улыбка»!`;
 }
