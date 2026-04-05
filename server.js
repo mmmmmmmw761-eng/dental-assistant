@@ -259,6 +259,9 @@ const TOOL_HANDLERS = {
 // Основной webhook для VAPI
 app.post("/webhook", async (req, res) => {
   try {
+    // Debug: видим что именно пришло от VAPI
+    console.log("[webhook] typeof req.body:", typeof req.body, "| body:", JSON.stringify(req.body));
+
     // Опциональная верификация секрета VAPI
     if (process.env.VAPI_SECRET) {
       const secret = req.headers["x-vapi-secret"];
@@ -277,7 +280,8 @@ app.post("/webhook", async (req, res) => {
     const results = await Promise.all(
       toolCallList.map(async (toolCall) => {
         const name = toolCall.function?.name;
-        const args = JSON.parse(toolCall.function?.arguments || "{}");
+        const rawArgs = toolCall.function?.arguments;
+        const args = typeof rawArgs === "string" ? JSON.parse(rawArgs || "{}") : (rawArgs ?? {});
         const handler = TOOL_HANDLERS[name];
 
         let result;
