@@ -4,6 +4,23 @@ Node.js сервер, который связывает голосовую AI-п
 
 ---
 
+## Быстрый запуск
+
+```bash
+git clone https://github.com/mmmmmmmw761-eng/dental-assistant.git
+cd dental-assistant
+npm install
+cp .env.example .env   # заполните переменные
+npm run dev
+```
+
+Проверьте: `GET http://localhost:3000/health` → `{"status":"ok"}`.
+
+Полные инструкции по Google Calendar, Railway и VAPI — в разделах ниже.  
+Готовый системный промпт для ассистента — в файле **[vapi-prompt.md](vapi-prompt.md)**.
+
+---
+
 ## Как это работает
 
 1. Пациент звонит на номер, подключённый к VAPI.
