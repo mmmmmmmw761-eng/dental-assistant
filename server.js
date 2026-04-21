@@ -3,28 +3,23 @@ require("dotenv").config();
 // ─── Проверка обязательных переменных окружения ───────────────────────────────
 
 const REQUIRED_ENV = [
-  "GOOGLE_SERVICE_ACCOUNT_EMAIL",
-  "GOOGLE_PRIVATE_KEY",
-  "GOOGLE_CALENDAR_ID",
+  "YCLIENTS_PARTNER_TOKEN",
+  "YCLIENTS_USER_TOKEN",
+  "YCLIENTS_COMPANY_ID",
   "VAPI_SECRET",
 ];
 
-const missingEnv = REQUIRED_ENV.filter((key) => !process.env[key]);
+const missingEnv = REQUIRED_ENV.filter((k) => !process.env[k]);
 if (missingEnv.length > 0) {
   console.error(`[startup] Missing required env vars: ${missingEnv.join(", ")}`);
   process.exit(1);
 }
 
 const express = require("express");
-const { google } = require("googleapis");
 const rateLimit = require("express-rate-limit");
 
 const app = express();
-
-// ─── Middleware ───────────────────────────────────────────────────────────────
-
 app.use(express.json({ limit: "32kb" }));
-
 app.use(
   rateLimit({
     windowMs: 60 * 1000,
@@ -35,42 +30,48 @@ app.use(
   })
 );
 
-// ─── Константы клиники ────────────────────────────────────────────────────────
+// ─── YClients ─────────────────────────────────────────────────────────────────
 
-const SLOT_DURATION_MINUTES = 30;
-const TZ_OFFSET = "+03:00"; // Europe/Moscow
-
-// Рабочие часы: last slot must END by hours.end
-const WORKING_HOURS = {
-  1: { start: 9, end: 18 }, // Понедельник
-  2: { start: 9, end: 18 }, // Вторник
-  3: { start: 9, end: 18 }, // Среда
-  4: { start: 9, end: 18 }, // Четверг
-  5: { start: 9, end: 18 }, // Пятница
-  6: { start: 9, end: 14 }, // Суббота
-  // 0 — воскресенье: выходной
+const PARTNER_TOKEN = process.env.YCLIENTS_PARTNER_TOKEN;
+const USER_TOKEN    = process.env.YCLIENTS_USER_TOKEN;
+const COMPANY_ID    = process.env.YCLIENTS_COMPANY_ID;
+const YC_BASE       = "https://api.yclients.com/api/v1";
+const YC_HEADERS    = {
+  Authorization:  `Bearer ${PARTNER_TOKEN}, User ${USER_TOKEN}`,
+  Accept:         "application/vnd.yclients.v2+json",
+  "Content-Type": "application/json",
 };
 
-// ─── Google Calendar ──────────────────────────────────────────────────────────
-
-function getCalendarClient() {
-  const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
-  const key = process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n");
-
-  const auth = new google.auth.JWT({
-    email,
-    key,
-    scopes: ["https://www.googleapis.com/auth/calendar"],
-  });
-  return google.calendar({ version: "v3", auth });
+async function ycFetch(path, options = {}) {
+  const res = await fetch(`${YC_BASE}${path}`, { headers: YC_HEADERS, ...options });
+  return res.json();
 }
 
-function logGoogleError(context, err) {
-  const status = err?.response?.status;
-  const message = err?.response?.data?.error?.message || err.message;
-  const errors = err?.response?.data?.error?.errors;
-  console.error(`[Google Calendar] ${context} — status: ${status ?? "n/a"}, message: ${message}`);
-  if (errors) console.error(`[Google Calendar] details:`, JSON.stringify(errors));
+// ─── Кэш услуг и сотрудников ──────────────────────────────────────────────────
+
+let servicesCache = []; // [{ id, title, duration }]
+let staffCache    = []; // [{ id, name }]
+
+async function loadCatalog() {
+  try {
+    const [svcRes, staffRes] = await Promise.all([
+      ycFetch(`/book_services/${COMPANY_ID}`),
+      ycFetch(`/book_staff/${COMPANY_ID}`),
+    ]);
+
+    if (svcRes.success) {
+      const d = svcRes.data;
+      servicesCache = Array.isArray(d) ? d : (d?.services ?? []);
+    }
+
+    if (staffRes.success) {
+      staffCache = staffRes.data ?? [];
+    }
+
+    console.log(`[yclients] ${servicesCache.length} services, ${staffCache.length} staff loaded`);
+  } catch (err) {
+    console.error("[yclients] catalog load error:", err.message);
+  }
 }
 
 // ─── Вспомогательные функции ─────────────────────────────────────────────────
@@ -80,135 +81,102 @@ function pad(n) {
 }
 
 /**
- * Генерирует все теоретически возможные слоты для заданной даты
- * в московском времени (UTC+3).
- * @param {string} dateStr — дата в формате YYYY-MM-DD
- * @returns {{ timeStr: string, startDate: Date }[]}
- */
-function generateSlots(dateStr) {
-  // Парсим компоненты даты напрямую, чтобы getDay() не зависел от timezone сервера
-  const [year, month, day] = dateStr.split("-").map(Number);
-  const dayOfWeek = new Date(year, month - 1, day).getDay();
-
-  const hours = WORKING_HOURS[dayOfWeek];
-  if (!hours) return [];
-
-  const slots = [];
-  let h = hours.start;
-  let m = 0;
-
-  while (true) {
-    // Слот должен полностью завершиться до конца рабочего дня
-    const endM = m + SLOT_DURATION_MINUTES;
-    const endH = h + Math.floor(endM / 60);
-    const endMin = endM % 60;
-    if (endH > hours.end || (endH === hours.end && endMin > 0)) break;
-
-    const timeStr = `${pad(h)}:${pad(m)}`;
-    // Явно указываем московский offset, чтобы UTC-сервер не сдвигал время
-    const startDate = new Date(`${dateStr}T${timeStr}:00${TZ_OFFSET}`);
-    slots.push({ timeStr, startDate });
-
-    m += SLOT_DURATION_MINUTES;
-    if (m >= 60) {
-      m -= 60;
-      h += 1;
-    }
-  }
-
-  return slots;
-}
-
-/**
- * Возвращает true, если слот [slotStart, slotEnd) пересекается с занятым диапазоном.
- */
-function isSlotBusy(slotStart, slotDurationMs, busyPeriods) {
-  const slotEnd = new Date(slotStart.getTime() + slotDurationMs);
-  return busyPeriods.some((busy) => {
-    const busyStart = new Date(busy.start);
-    const busyEnd = new Date(busy.end);
-    return slotStart < busyEnd && slotEnd > busyStart;
-  });
-}
-
-/**
- * Форматирует дату YYYY-MM-DD на русском, например "15 июня 2025".
- * Не создаёт Date-объект, чтобы не зависеть от timezone сервера.
+ * Форматирует YYYY-MM-DD → "22 апреля 2026"
  */
 function formatDateRu(dateStr) {
   const months = [
-    "января", "февраля", "марта", "апреля", "мая", "июня",
-    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+    "января","февраля","марта","апреля","мая","июня",
+    "июля","августа","сентября","октября","ноября","декабря",
   ];
   const [year, month, day] = dateStr.split("-").map(Number);
   return `${day} ${months[month - 1]} ${year}`;
+}
+
+/**
+ * Нормализует телефон в формат +7XXXXXXXXXX
+ */
+function normalizePhone(phone) {
+  const digits = String(phone).replace(/\D/g, "");
+  if (digits.length === 11 && digits[0] === "8") return "+7" + digits.slice(1);
+  if (digits.length === 11 && digits[0] === "7") return "+"  + digits;
+  if (digits.length === 10)                       return "+7" + digits;
+  return "+" + digits;
+}
+
+/**
+ * Ищет услугу по частичному совпадению названия (регистронезависимо).
+ * Если не найдено — возвращает первую из кэша.
+ */
+function matchService(name) {
+  if (!servicesCache.length) return null;
+  if (!name) return servicesCache[0];
+  const q = name.toLowerCase();
+  return (
+    servicesCache.find((s) => s.title.toLowerCase() === q) ||
+    servicesCache.find((s) => s.title.toLowerCase().includes(q)) ||
+    servicesCache[0]
+  );
 }
 
 // ─── Обработчики инструментов VAPI ───────────────────────────────────────────
 
 /**
  * check-availability
- * Ожидаемые аргументы: { date: "YYYY-MM-DD" }
+ * Аргументы: { date: "YYYY-MM-DD" }
  */
 async function checkAvailability({ date }) {
   if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     return "Пожалуйста, укажите дату в формате ГГГГ-ММ-ДД, например 2025-06-15.";
   }
 
-  const slots = generateSlots(date);
-  if (slots.length === 0) {
-    return `${formatDateRu(date)} — выходной день. Клиника работает с понедельника по субботу.`;
+  const staffId   = staffCache[0]?.id ?? 0;
+  const serviceId = servicesCache[0]?.id;
+
+  if (!serviceId) {
+    return "Расписание временно недоступно. Позвоните нам напрямую.";
   }
 
-  const calendar = getCalendarClient();
-  const calendarId = process.env.GOOGLE_CALENDAR_ID;
-
-  // Границы дня в московском времени
-  const dayStart = new Date(`${date}T00:00:00${TZ_OFFSET}`).toISOString();
-  const dayEnd = new Date(`${date}T23:59:59${TZ_OFFSET}`).toISOString();
-
-  let freeBusyResponse;
+  let data;
   try {
-    freeBusyResponse = await calendar.freebusy.query({
-      requestBody: {
-        timeMin: dayStart,
-        timeMax: dayEnd,
-        items: [{ id: calendarId }],
-      },
-    });
+    data = await ycFetch(
+      `/book_times/${COMPANY_ID}/${staffId}/${date}?services[]=${serviceId}`
+    );
   } catch (err) {
-    logGoogleError(`checkAvailability freebusy.query date=${date}`, err);
-    throw err;
+    console.error("[check-availability] fetch error:", err.message);
+    return "Не удалось получить расписание. Попробуйте ещё раз.";
   }
 
-  const busyPeriods = freeBusyResponse.data.calendars[calendarId]?.busy || [];
-  const slotDurationMs = SLOT_DURATION_MINUTES * 60 * 1000;
+  if (!data.success) {
+    console.error("[check-availability] YClients error:", data?.meta?.message);
+    return `На ${formatDateRu(date)} запись недоступна. Хотите выбрать другой день?`;
+  }
 
-  const freeSlots = slots.filter((s) => !isSlotBusy(s.startDate, slotDurationMs, busyPeriods));
+  const free = (data.data ?? []).filter((s) => s.available);
 
-  if (freeSlots.length === 0) {
+  if (free.length === 0) {
     return `На ${formatDateRu(date)} свободных окон нет. Хотите выбрать другой день?`;
   }
 
-  const timeList = freeSlots.map((s) => s.timeStr).join(", ");
+  const timeList = free.map((s) => s.time.slice(0, 5)).join(", ");
   return `На ${formatDateRu(date)} доступно следующее время: ${timeList}. Какое время вам удобно?`;
 }
 
 /**
  * book-appointment
- * Ожидаемые аргументы: { patient_name, service, date, time }
+ * Аргументы: { patient_name, phone, service, date, time }
  */
-async function bookAppointment({ patient_name, service, date, time }) {
-  if (!patient_name || !service || !date || !time) {
-    return "Для записи нужны: имя пациента, услуга, дата и время приёма.";
+async function bookAppointment({ patient_name, phone, service, date, time }) {
+  // Валидация обязательных полей
+  if (!patient_name || !phone || !date || !time) {
+    return "Для записи нужны: имя пациента, номер телефона, дата и время приёма.";
   }
 
   if (typeof patient_name !== "string" || patient_name.trim().length === 0 || patient_name.length > 100) {
-    return "Пожалуйста, укажите корректное имя пациента (не более 100 символов).";
+    return "Пожалуйста, укажите корректное имя (не более 100 символов).";
   }
 
-  if (typeof service !== "string" || service.trim().length === 0 || service.length > 200) {
-    return "Пожалуйста, укажите корректное название услуги (не более 200 символов).";
+  if (service && (typeof service !== "string" || service.length > 200)) {
+    return "Пожалуйста, укажите корректное название услуги.";
   }
 
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
@@ -219,74 +187,62 @@ async function bookAppointment({ patient_name, service, date, time }) {
     return "Время должно быть в формате ЧЧ:ММ, например 10:30.";
   }
 
-  const validSlots = generateSlots(date);
-  if (validSlots.length === 0) {
-    return `${formatDateRu(date)} — выходной день. Пожалуйста, выберите рабочий день.`;
+  const normalizedPhone = normalizePhone(phone);
+  if (normalizedPhone.replace(/\D/g, "").length < 10) {
+    return "Укажите корректный номер телефона.";
   }
 
-  if (!validSlots.some((s) => s.timeStr === time)) {
-    return `Время ${time} недоступно. Пожалуйста, выберите одно из допустимых окон.`;
+  const svc = matchService(service);
+  if (!svc) {
+    return "Услуги клиники временно недоступны. Попробуйте позже.";
   }
 
-  // Создаём даты с явным московским offset
-  const startDateTime = new Date(`${date}T${time}:00${TZ_OFFSET}`);
-  const endDateTime = new Date(startDateTime.getTime() + SLOT_DURATION_MINUTES * 60 * 1000);
+  const staffId  = staffCache[0]?.id ?? 0;
+  const datetime = `${date} ${time}:00`;
 
-  const calendar = getCalendarClient();
-  const calendarId = process.env.GOOGLE_CALENDAR_ID;
-
-  let freeBusyResponse;
+  let data;
   try {
-    freeBusyResponse = await calendar.freebusy.query({
-      requestBody: {
-        timeMin: startDateTime.toISOString(),
-        timeMax: endDateTime.toISOString(),
-        items: [{ id: calendarId }],
-      },
+    data = await ycFetch(`/book_record/${COMPANY_ID}`, {
+      method: "POST",
+      body: JSON.stringify({
+        phone:     normalizedPhone,
+        fullname:  patient_name,
+        email:     "",
+        appointments: [{
+          id:       1,
+          services: [svc.id],
+          staff_id: staffId,
+          datetime,
+        }],
+      }),
     });
   } catch (err) {
-    logGoogleError(`bookAppointment freebusy.query date=${date} time=${time}`, err);
-    throw err;
+    console.error("[book-appointment] fetch error:", err.message);
+    return "Произошла ошибка при записи. Пожалуйста, попробуйте ещё раз.";
   }
 
-  const busyPeriods = freeBusyResponse.data.calendars[calendarId]?.busy || [];
-  if (busyPeriods.length > 0) {
-    return `К сожалению, время ${time} на ${formatDateRu(date)} уже занято. Хотите выбрать другое?`;
+  if (!data.success) {
+    const msg = data?.meta?.message || "";
+    console.error("[book-appointment] YClients error:", msg);
+    return `К сожалению, не удалось записать на ${time} ${formatDateRu(date)}. Попробуйте другое время.`;
   }
 
-  try {
-    await calendar.events.insert({
-      calendarId,
-      requestBody: {
-        summary: `${service} — ${patient_name}`,
-        description: `Пациент: ${patient_name}\nУслуга: ${service}`,
-        start: { dateTime: startDateTime.toISOString(), timeZone: "Europe/Moscow" },
-        end: { dateTime: endDateTime.toISOString(), timeZone: "Europe/Moscow" },
-      },
-    });
-  } catch (err) {
-    logGoogleError(`bookAppointment events.insert date=${date} time=${time}`, err);
-    throw err;
-  }
-
-  return `Отлично! ${patient_name}, вы записаны на ${service} ${formatDateRu(date)} в ${time}. Ждём вас в клинике «Улыбка»!`;
+  const svcTitle = service?.trim() || svc.title;
+  return `Отлично! ${patient_name}, вы записаны на ${svcTitle} ${formatDateRu(date)} в ${time}. Ждём вас в клинике!`;
 }
 
 // ─── Диспетчер инструментов ───────────────────────────────────────────────────
 
 const TOOL_HANDLERS = {
   "check-availability": checkAvailability,
-  "book-appointment": bookAppointment,
+  "book-appointment":   bookAppointment,
 };
 
 // ─── Маршруты ─────────────────────────────────────────────────────────────────
 
-// Основной webhook для VAPI
 app.post("/webhook", async (req, res) => {
   try {
-    // VAPI_SECRET обязателен — проверяем всегда
-    const secret = req.headers["x-vapi-secret"];
-    if (secret !== process.env.VAPI_SECRET) {
+    if (req.headers["x-vapi-secret"] !== process.env.VAPI_SECRET) {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
@@ -295,12 +251,11 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).json({ received: true });
     }
 
-    const toolCallList = message.toolCallList || [];
     const results = await Promise.all(
-      toolCallList.map(async (toolCall) => {
-        const name = toolCall.function?.name;
+      (message.toolCallList ?? []).map(async (toolCall) => {
+        const name    = toolCall.function?.name;
         const rawArgs = toolCall.function?.arguments;
-        const args = typeof rawArgs === "string" ? JSON.parse(rawArgs || "{}") : (rawArgs ?? {});
+        const args    = typeof rawArgs === "string" ? JSON.parse(rawArgs || "{}") : (rawArgs ?? {});
         const handler = TOOL_HANDLERS[name];
 
         let result;
@@ -311,7 +266,7 @@ app.post("/webhook", async (req, res) => {
             result = await handler(args);
           } catch (err) {
             console.error(`[tool] "${name}" error:`, err.message);
-            result = "Произошла ошибка при обработке запроса. Пожалуйста, попробуйте ещё раз.";
+            result = "Произошла ошибка при обработке запроса. Попробуйте ещё раз.";
           }
         }
 
@@ -326,7 +281,6 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// Health check для Railway / мониторинга
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", service: "dental-assistant-vapi" });
 });
@@ -334,6 +288,7 @@ app.get("/health", (_req, res) => {
 // ─── Запуск ───────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Dental assistant server running on port ${PORT}`);
+  await loadCatalog(); // загружаем услуги и сотрудников при старте
 });
