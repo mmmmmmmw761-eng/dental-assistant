@@ -1,7 +1,7 @@
 {
   "name": "dental-assistant-vapi",
   "version": "1.0.0",
-  "description": "Voice assistant server for dental clinic Ulybka — VAPI + Google Calendar integration",
+  "description": "Universal voice assistant backend for service businesses — VAPI + booking integrations",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
