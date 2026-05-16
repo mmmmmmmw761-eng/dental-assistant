@@ -176,9 +176,57 @@ function findStaffInBusiness(business, query) {
     staff.find((person) => normalizeText(person.name) === q) ||
     staff.find((person) => (person.aliases || []).some((alias) => normalizeText(alias) === q)) ||
     staff.find((person) => normalizeText(person.name).includes(q)) ||
+    staff.find((person) => normalizeText(person.role).includes(q) || q.includes(normalizeText(person.role))) ||
     staff.find((person) => (person.aliases || []).some((alias) => normalizeText(alias).includes(q) || q.includes(normalizeText(alias)))) ||
+    staff.find((person) => (person.services || []).some((serviceName) => normalizeText(serviceName).includes(q) || q.includes(normalizeText(serviceName)))) ||
     null
   );
+}
+
+function findStaffMatchesInBusiness(business, query) {
+  const staff = business.staff || [];
+  if (!staff.length) return [];
+
+  const q = normalizeText(query);
+  if (!q) return [];
+
+  const listAllPatterns = [
+    "специалист",
+    "специалисты",
+    "врачи",
+    "стоматологи",
+    "кто есть",
+    "все имена",
+    "все фамилии",
+    "по именам",
+    "по фамилиям",
+    "какие специалисты",
+    "какие врачи",
+    "какие стоматологи",
+    "все врачи",
+    "все специалисты"
+  ];
+
+  if (listAllPatterns.some((pattern) => q.includes(pattern))) {
+    return staff;
+  }
+
+  return staff.filter((person) => {
+    const name = normalizeText(person.name);
+    const role = normalizeText(person.role);
+    const aliases = (person.aliases || []).map((alias) => normalizeText(alias));
+    const services = (person.services || []).map((serviceName) => normalizeText(serviceName));
+
+    return (
+      name === q ||
+      name.includes(q) ||
+      q.includes(name) ||
+      role.includes(q) ||
+      q.includes(role) ||
+      aliases.some((alias) => alias === q || alias.includes(q) || q.includes(alias)) ||
+      services.some((serviceName) => serviceName.includes(q) || q.includes(serviceName))
+    );
+  });
 }
 
 function getWorkingInterval(business, date) {
@@ -258,12 +306,21 @@ async function findService(args = {}) {
 
 async function findStaff(args = {}) {
   const business = getBusiness(getBusinessId(args));
-  const staff = findStaffInBusiness(business, args.staff || args.query);
+  const query = args.staff || args.query;
+  const matches = findStaffMatchesInBusiness(business, query);
 
-  if (!staff) {
+  if (!matches.length) {
     return "Такого сотрудника в профиле не нашла. Можно предложить запись к любому свободному специалисту.";
   }
 
+  if (matches.length > 1) {
+    const list = matches
+      .map((person) => `${person.name}${person.role ? ` - ${person.role}` : ""}`)
+      .join("; ");
+    return `В профиле клиники есть специалисты: ${list}. Если нужен конкретный врач, скажите имя, фамилию или профиль специалиста.`;
+  }
+
+  const staff = matches[0];
   const role = staff.role ? `, ${staff.role}` : "";
   const services = staff.services?.length ? ` Работает с услугами: ${staff.services.join(", ")}.` : "";
   return `Сотрудник найден: ${staff.name}${role}.${services}`;
